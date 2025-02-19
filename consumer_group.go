@@ -861,43 +861,37 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 		return nil, err
 	}
 
-	// start consuming
+	// consume a single topic/partition, blocking
+	consumeTopicPartition := func(sess *consumerGroupSession, topic string, partition int32) {
+		sess.waitGroup.Add(1)
+		defer sess.waitGroup.Done()
+
+		// cancel the group session as soon as any of the consume calls return
+		defer sess.cancel()
+
+		// if partition not currently readable, wait for it to become readable
+		if sess.parent.client.PartitionNotReadable(topic, partition) {
+			timer := time.NewTimer(5 * time.Second)
+			for sess.parent.client.PartitionNotReadable(topic, partition) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-parent.closed:
+					return
+				case <-timer.C:
+					timer.Reset(5 * time.Second)
+				}
+			}
+			timer.Stop()
+		}
+
+		sess.consume(topic, partition)
+	}
+
+	// start consuming each topic partition in a goroutine
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
-			if parent.client.PartitionNotReadable(topic, partition) {
-				// partition not readable, wait for it to become readable
-				go func(topic string, partition int32) {
-					timer := time.NewTimer(5 * time.Second)
-					for parent.client.PartitionNotReadable(topic, partition) {
-						select {
-						case <-ctx.Done():
-							return
-						case <-parent.closed:
-							return
-						case <-timer.C:
-							timer.Reset(5 * time.Second)
-						}
-					}
-					timer.Stop()
-					sess.waitGroup.Add(1)
-					defer sess.waitGroup.Done()
-					defer sess.cancel()
-					sess.consume(topic, partition)
-				}(topic, partition)
-				continue
-			}
-			sess.waitGroup.Add(1)
-
-			go func(topic string, partition int32) {
-				defer sess.waitGroup.Done()
-
-				// cancel the as session as soon as the first
-				// goroutine exits
-				defer sess.cancel()
-
-				// consume a single topic/partition, blocking
-				sess.consume(topic, partition)
-			}(topic, partition)
+			go consumeTopicPartition(sess, topic, partition)
 		}
 	}
 	return sess, nil
